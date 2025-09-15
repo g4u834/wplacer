@@ -59,6 +59,8 @@ const TEMPLATES_PATH = path.join(DATA_DIR, 'templates.json');
 const JSON_LIMIT = '50mb';
 
 const MS = {
+    QUARTER_SEC: 250,
+    TWO_SEC: 2_000,
     THIRTY_SEC: 30_000,
     TWO_MIN: 120_000,
     FIVE_MIN: 300_000,
@@ -389,12 +391,21 @@ class WPlacer {
         this.userInfo = null;
         this.tiles = new Map();
         this.token = null;
+        this.pawtect = null;
     }
 
     async _fetch(url, options) {
         try {
-            // Add a default timeout to all requests to prevent hangs
-            const optsWithTimeout = { timeout: 30000, ...options };
+            // Add a default timeout and browser-like defaults to reduce CF challenges
+            const defaultHeaders = {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+                'Accept': 'application/json, text/plain, */*',
+                'Accept-Language': 'en-US,en;q=0.9',
+                // Referer helps some CF setups; safe default for this backend
+                'Referer': 'https://wplace.live/'
+            };
+            const mergedHeaders = { ...(defaultHeaders), ...(options?.headers || {}) };
+            const optsWithTimeout = { timeout: 30000, ...options, headers: mergedHeaders };
             return await this.browser.fetch(url, optsWithTimeout);
         } catch (error) {
             if (error.code === 'InvalidArg') {
@@ -411,6 +422,8 @@ class WPlacer {
         for (const k of Object.keys(this.cookies)) {
             jar.setCookieSync(`${k}=${this.cookies[k]}; Path=/`, WPLACE_BASE);
         }
+        const sleepTime = Math.floor(Math.random() * MS.TWO_SEC) + MS.QUARTER_SEC;
+        await sleep(sleepTime);
         const opts = { cookieJar: jar, browser: 'chrome', ignoreTlsErrors: true };
         const proxyUrl = getNextProxy();
         if (proxyUrl) {
@@ -443,6 +456,15 @@ class WPlacer {
                 throw new NetworkError('(401) Unauthorized. The cookie may be invalid or the current IP/proxy is rate-limited.');
             if (userInfo.error) throw new Error(`(500) Auth failed: "${userInfo.error}".`);
             if (userInfo.id && userInfo.name) {
+                const suspendedUntil = users[userInfo.id]?.suspendedUntil; // Grab suspendedUntil property from config files
+                const isStillSuspended = suspendedUntil > new Date();
+
+                // And create a new property in UserInfo
+                userInfo["ban"] = {
+                    status: isStillSuspended,
+                    until: suspendedUntil
+                };
+
                 this.userInfo = userInfo;
                 ChargeCache.markFromUserInfo(userInfo);
                 return true;
@@ -457,9 +479,11 @@ class WPlacer {
     }
 
     async post(url, body) {
+        const headers = { 'Content-Type': 'text/plain;charset=UTF-8' };
+        if (this.pawtect) headers['x-pawtect-token'] = this.pawtect;
         const req = await this._fetch(url, {
             method: 'POST',
-            headers: { Accept: '*/*', 'Content-Type': 'text/plain;charset=UTF-8', Referer: 'https://wplace.live/' },
+            headers,
             body: JSON.stringify(body),
         });
         const data = await req.json();
@@ -726,6 +750,7 @@ class WPlacer {
         for (const k in byTile) {
             const [tx, ty] = k.split(',').map(Number);
             const body = { ...byTile[k], t: this.token };
+            if (globalThis.__wplacer_last_fp) body.fp = globalThis.__wplacer_last_fp;
             const r = await this._executePaint(tx, ty, body);
             total += r.painted;
         }
@@ -996,6 +1021,28 @@ const saveSettings = () => saveJSON(SETTINGS_FILE, currentSettings);
 // ---------- Server state ----------
 
 const activeBrowserUsers = new Set();
+// Cache last-known user status to avoid 409s when user is briefly busy
+const STATUS_CACHE_TTL = 10 * 60_000; // 10 minutes
+const statusCache = new Map(); // id -> { data, ts }
+const setStatusCache = (id, data) => {
+    try { statusCache.set(String(id), { data, ts: Date.now() }); } catch {}
+};
+const getStatusCache = (id) => {
+    const e = statusCache.get(String(id));
+    if (!e) return null;
+    if (Date.now() - e.ts > STATUS_CACHE_TTL) {
+        statusCache.delete(String(id));
+        return null;
+    }
+    return e.data;
+};
+const waitForNotBusy = async (id, timeoutMs = 5_000) => {
+    const t0 = Date.now();
+    while (activeBrowserUsers.has(id) && Date.now() - t0 < timeoutMs) {
+        await sleep(200);
+    }
+    return !activeBrowserUsers.has(id);
+};
 const activeTemplateUsers = new Set();
 const templateQueue = [];
 let activePaintingTasks = 0;
@@ -1179,14 +1226,27 @@ class TemplateManager {
         while (!done && this.running) {
             try {
                 wplacer.token = await TokenManager.getToken(this.name);
+                // Pull latest pawtect token if available
+                wplacer.pawtect = globalThis.__wplacer_last_pawtect || null;
                 const painted = await wplacer.paint(this.currentPixelSkip, colorFilter);
                 paintedTotal += painted;
                 done = true;
             } catch (error) {
                 if (error.name === 'SuspensionError') {
                     const until = new Date(error.suspendedUntil).toLocaleString();
-                    log(wplacer.userInfo.id, wplacer.userInfo.name, `[${this.name}] 🛑 Account suspended until ${until}.`);
-                    users[wplacer.userInfo.id].suspendedUntil = error.suspendedUntil;
+                    
+                    // Difference between a BAN and a SUSPENSION of the account.
+                    if (error.durationMs > 0) log(wplacer.userInfo.id, wplacer.userInfo.name, `[${this.name}] 🛑 Account suspended until ${until}.`);
+                    else log(wplacer.userInfo.id, wplacer.userInfo.name, `[${this.name}] 🛑 Account BANNED PERMANENTLY, banned due to ${error.reason}.`)
+                    
+                    /*
+                    
+                    If a BAN has been issued, instead of setting suspendedUntil to wpalcer's suspendedUntil (current date in ms),
+                    set it to a HUGE number to avoid modifying any logic in the rest of the code, and still perform properly with
+                    the banned account.
+                    
+                    */
+                    users[wplacer.userInfo.id].suspendedUntil = error.durationMs > 0 ? error.suspendedUntil : Number.MAX_SAFE_INTEGER;
                     saveUsers();
                     throw error;
                 }
@@ -1600,9 +1660,19 @@ app.get('/errors', (req, res) => {
 
 app.get('/token-needed', (_req, res) => res.json({ needed: TokenManager.isTokenNeeded }));
 app.post('/t', (req, res) => {
-    const { t } = req.body || {};
+    const { t, pawtect, fp } = req.body || {};
     if (!t) return res.sendStatus(HTTP_STATUS.BAD_REQ);
+    // Store Turnstile token as usual
     TokenManager.setToken(t);
+    // Also keep latest pawtect in memory for pairing with paints
+    try {
+        if (pawtect && typeof pawtect === 'string') {
+            globalThis.__wplacer_last_pawtect = pawtect;
+        }
+        if (fp && typeof fp === 'string') {
+            globalThis.__wplacer_last_fp = fp;
+        }
+    } catch {}
     res.sendStatus(HTTP_STATUS.OK);
 });
 
@@ -1614,11 +1684,16 @@ app.post('/user', async (req, res) => {
     const wplacer = new WPlacer({});
     try {
         const userInfo = await wplacer.login(req.body.cookies);
+        let banned = users[userInfo.id]?.suspendedUntil; // Save any previous suspendedUntil property
         users[userInfo.id] = {
             name: userInfo.name,
             cookies: req.body.cookies,
             expirationDate: req.body.expirationDate,
         };
+
+        if (banned && banned > new Date())
+            users[userInfo.id].suspendedUntil = banned // Restore the suspsendedUntil property from users file if is still suspended
+
         saveUsers();
         res.json(userInfo);
     } catch (error) {
@@ -1661,11 +1736,23 @@ app.delete('/user/:id', async (req, res) => {
 
 app.get('/user/status/:id', async (req, res) => {
     const { id } = req.params;
-    if (!users[id] || activeBrowserUsers.has(id)) return res.sendStatus(HTTP_STATUS.CONFLICT);
+    if (!users[id]) return res.status(HTTP_STATUS.CONFLICT).json({ error: 'User not found' });
+
+    // If busy, wait briefly; if still busy, try to return cached status
+    if (activeBrowserUsers.has(id)) {
+        const ok = await waitForNotBusy(id, 5_000);
+        if (!ok) {
+            const cached = getStatusCache(id);
+            if (cached) return res.status(HTTP_STATUS.OK).json({ ...cached, cached: true });
+            return res.status(HTTP_STATUS.CONFLICT).json({ error: 'User is busy' });
+        }
+    }
+
     activeBrowserUsers.add(id);
     const wplacer = new WPlacer({});
     try {
         const userInfo = await wplacer.login(users[id].cookies);
+        setStatusCache(id, userInfo);
         res.status(HTTP_STATUS.OK).json(userInfo);
     } catch (error) {
         logUserError(error, id, users[id].name, 'validate cookie');
@@ -1692,6 +1779,7 @@ app.post('/users/status', async (_req, res) => {
         const wplacer = new WPlacer({});
         try {
             const userInfo = await wplacer.login(users[id].cookies);
+            setStatusCache(id, userInfo);
             results[id] = { success: true, data: userInfo };
         } catch (error) {
             logUserError(error, id, users[id].name, 'bulk check');
@@ -1923,6 +2011,7 @@ app.post('/reload-proxies', (_req, res) => {
 });
 
 // Canvas proxy (returns data URI)
+// Return raw PNG; short cache for smoother previews in the UI
 app.get('/canvas', async (req, res) => {
     const { tx, ty } = req.query;
     if (isNaN(parseInt(tx)) || isNaN(parseInt(ty))) return res.sendStatus(HTTP_STATUS.BAD_REQ);
@@ -1930,11 +2019,29 @@ app.get('/canvas', async (req, res) => {
         const proxyUrl = getNextProxy();
         const imp = new Impit({ ignoreTlsErrors: true, ...(proxyUrl ? { proxyUrl } : {}) });
         const r = await imp.fetch(TILE_URL(tx, ty));
-        if (!r.ok) return res.sendStatus(response.status);
+        if (!r.ok) return res.sendStatus(r.status);
         const buffer = Buffer.from(await r.arrayBuffer());
-        res.json({ image: `data:image/png;base64,${buffer.toString('base64')}` });
+        res.set('Content-Type', 'image/png');
+        res.set('Cache-Control', 'public, max-age=30');
+        res.send(buffer);
     } catch (error) {
         res.status(HTTP_STATUS.SRV_ERR).json({ error: error.message });
+    }
+});
+
+// Palette API for UI to stay in sync with server palette and names
+// Used by the UI to sync palette on startup
+app.get('/palette', (_req, res) => {
+    try {
+        const colors = Object.entries(palette).map(([rgb, id]) => ({
+            id,
+            rgb,
+            name: COLOR_NAMES[id] || null,
+        }));
+        res.json({ colors });
+    } catch (e) {
+        console.warn('[palette] failed:', e?.message || e);
+        res.status(HTTP_STATUS.SRV_ERR).json({ error: 'Failed to get palette' });
     }
 });
 
@@ -2132,7 +2239,7 @@ const diffVer = (v1, v2) => {
                 ▒▒▒▒▒                                          v${version}`));
     // check versions (dont delete this ffs)
     try {
-        const githubPackage = await fetch("https://raw.githubusercontent.com/luluwaffless/wplacer/refs/heads/main/package.json");
+        const githubPackage = await fetch("https://raw.githubusercontent.com/wplacer/wplacer/refs/heads/main/package.json");
         const githubVersion = (await githubPackage.json()).version;
         const diff = diffVer(version, githubVersion);
         if (diff !== 0) console.warn(`${diff < 0 ? "⚠️ Outdated version! Please update using \"git pull\"." : "🤖 Unreleased."}\n  GitHub: ${githubVersion}\n  Local: ${version} (${diff})`);
@@ -2238,11 +2345,21 @@ const diffVer = (v1, v2) => {
                         if (event === 'change') {
                             try {
                                 const stats = statSync(file);
+                                // Handle truncation/rotation
+                                if (stats.size < lastSize) lastSize = 0;
                                 if (stats.size > lastSize) {
-                                    const fd = readFileSync(file);
-                                    const newData = fd.slice(lastSize).toString();
-                                    newData.split(/\r?\n/).filter(Boolean).forEach(line => broadcastLog(type, line));
-                                    lastSize = stats.size;
+                                    const start = lastSize;
+                                    const endSize = stats.size;
+                                    const stream = createReadStream(file, { start });
+                                    let buffer = '';
+                                    stream.on('data', (chunk) => { buffer += chunk.toString(); });
+                                    stream.on('end', () => {
+                                        buffer.split(/\r?\n/).filter(Boolean).forEach((line) => broadcastLog(type, line));
+                                        lastSize = endSize;
+                                    });
+                                    stream.on('error', (err) => {
+                                        console.warn('[logs] tail error:', err?.message || err);
+                                    });
                                 }
                             } catch {}
                         }
