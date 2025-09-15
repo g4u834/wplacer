@@ -12,7 +12,7 @@ process.on('uncaughtException', (err) => {
 });
 import { existsSync, readFileSync, writeFileSync, mkdirSync, appendFileSync } from 'node:fs';
 import { Image, createCanvas } from 'canvas';
-import { exec } from 'node:child_process';
+import { exec, execFile } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { CookieJar } from 'tough-cookie';
 import gradient from 'gradient-string';
@@ -55,12 +55,11 @@ const DATA_DIR = './data';
 const USERS_FILE = path.join(DATA_DIR, 'users.json');
 const SETTINGS_FILE = path.join(DATA_DIR, 'settings.json');
 const TEMPLATES_PATH = path.join(DATA_DIR, 'templates.json');
+const ACCOUNT_CACHE_FILE = path.join(DATA_DIR, 'account_cache.json');
 
 const JSON_LIMIT = '50mb';
 
 const MS = {
-    QUARTER_SEC: 250,
-    TWO_SEC: 2_000,
     THIRTY_SEC: 30_000,
     TWO_MIN: 120_000,
     FIVE_MIN: 300_000,
@@ -94,16 +93,41 @@ for (const file of logFiles) {
     }
 }
 
+// Account cache bootstrap
+function loadJSONSafe(file, def = {}) {
+    try {
+        return loadJSON(file);
+    } catch {
+        return def;
+    }
+}
+let accountCache = existsSync(ACCOUNT_CACHE_FILE) ? loadJSONSafe(ACCOUNT_CACHE_FILE, {}) : {};
+const saveAccountCache = () => writeFileSync(ACCOUNT_CACHE_FILE, JSON.stringify(accountCache, null, 2));
+
 /** Structured logger. Errors to errors.log, info to logs.log. */
 const log = async (id, name, data, error) => {
     const ts = new Date().toLocaleString();
-    const who = `(${name}#${id})`;
+    const who = currentSettings?.anonymizeLogs ? `(user xxx#xxx)` : `(${name}#${id})`;
+    const maskData = (text) => {
+        if (!currentSettings?.anonymizeLogs) return text;
+        try {
+            let s = String(text);
+            // Mask coordinate-like pairs: "123, 45" -> "xxx,xx"
+            s = s.replace(/-?\d{1,5}\s*,\s*-?\d{1,5}/g, 'xxx,xx');
+            // Mask occurrences like "user John" -> "user xxx"
+            s = s.replace(/\buser\s+[^\s.,:;!)\]]+/gi, 'user xxx');
+            return s;
+        } catch {
+            return text;
+        }
+    };
+    const safeData = maskData(data);
     if (error) {
-        console.error(`[${ts}] ${who} ${data}:`, error);
-        appendFileSync(path.join(DATA_DIR, 'errors.log'), `[${ts}] ${who} ${data}: ${error.stack || error.message}\n`);
+        console.error(`[${ts}] ${who} ${safeData}:`, error);
+        appendFileSync(path.join(DATA_DIR, 'errors.log'), `[${ts}] ${who} ${safeData}: ${error.stack || error.message}\n`);
     } else {
-        console.log(`[${ts}] ${who} ${data}`);
-        appendFileSync(path.join(DATA_DIR, 'logs.log'), `[${ts}] ${who} ${data}\n`);
+        console.log(`[${ts}] ${who} ${safeData}`);
+        appendFileSync(path.join(DATA_DIR, 'logs.log'), `[${ts}] ${who} ${safeData}\n`);
     }
 };
 
@@ -211,6 +235,14 @@ const ChargeCache = {
     markFromUserInfo(userInfo, now = Date.now()) {
         if (!userInfo?.id || !userInfo?.charges) return;
         const k = this._key(userInfo.id);
+        const base = Math.floor(userInfo.charges.count ?? 0);
+        const max = Math.floor(userInfo.charges.max ?? 0);
+        this._m.set(k, { base, max, lastSync: now });
+    },
+    // Also allow marking by a local (template/user map) ID to avoid mismatches
+    markForLocal(localId, userInfo, now = Date.now()) {
+        if (!localId || !userInfo?.charges) return;
+        const k = this._key(localId);
         const base = Math.floor(userInfo.charges.count ?? 0);
         const max = Math.floor(userInfo.charges.max ?? 0);
         this._m.set(k, { base, max, lastSync: now });
@@ -391,22 +423,38 @@ class WPlacer {
         this.userInfo = null;
         this.tiles = new Map();
         this.token = null;
-        this.pawtect = null;
     }
 
     async _fetch(url, options) {
         try {
-            // Add a default timeout and browser-like defaults to reduce CF challenges
-            const defaultHeaders = {
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
-                'Accept': 'application/json, text/plain, */*',
-                'Accept-Language': 'en-US,en;q=0.9',
-                // Referer helps some CF setups; safe default for this backend
-                'Referer': 'https://wplace.live/'
-            };
-            const mergedHeaders = { ...(defaultHeaders), ...(options?.headers || {}) };
-            const optsWithTimeout = { timeout: 30000, ...options, headers: mergedHeaders };
-            return await this.browser.fetch(url, optsWithTimeout);
+            // Add a default timeout to all requests to prevent hangs
+            const optsWithTimeout = { timeout: 30000, ...options };
+            const start = Date.now();
+            try { recordProxyRequestStart(this.browser?.options?.proxyUrl || 'direct'); } catch {}
+            const res = await this.browser.fetch(url, optsWithTimeout);
+            try {
+                const proxyKey = this.browser?.options?.proxyUrl || 'direct';
+                const out = Number(res.headers.get('content-length')) || 0;
+                recordProxyTraffic(proxyKey, out, 0);
+                const took = Date.now() - start;
+                const label = proxyLabelFromKey(proxyKey);
+                // fire-and-forget IP resolve and log append
+                resolveProxyIp(proxyKey).then((ip) => {
+                    appendNetworkLog({
+                        t: Date.now(),
+                        proxy: label,
+                        ip: ip || null,
+                        method: (optsWithTimeout.method || 'GET'),
+                        url,
+                        status: res.status,
+                        bytesOut: out,
+                        ms: took
+                    });
+                }).catch(() => {
+                    appendNetworkLog({ t: Date.now(), proxy: label, ip: null, method: (optsWithTimeout.method || 'GET'), url, status: res.status, bytesOut: out, ms: took });
+                });
+            } catch {}
+            return res;
         } catch (error) {
             if (error.code === 'InvalidArg') {
                 throw new NetworkError(`Internal fetch error (InvalidArg) for URL: ${url}. This may be a temporary network issue or a problem with a proxy.`);
@@ -422,8 +470,6 @@ class WPlacer {
         for (const k of Object.keys(this.cookies)) {
             jar.setCookieSync(`${k}=${this.cookies[k]}; Path=/`, WPLACE_BASE);
         }
-        const sleepTime = Math.floor(Math.random() * MS.TWO_SEC) + MS.QUARTER_SEC;
-        await sleep(sleepTime);
         const opts = { cookieJar: jar, browser: 'chrome', ignoreTlsErrors: true };
         const proxyUrl = getNextProxy();
         if (proxyUrl) {
@@ -456,15 +502,6 @@ class WPlacer {
                 throw new NetworkError('(401) Unauthorized. The cookie may be invalid or the current IP/proxy is rate-limited.');
             if (userInfo.error) throw new Error(`(500) Auth failed: "${userInfo.error}".`);
             if (userInfo.id && userInfo.name) {
-                const suspendedUntil = users[userInfo.id]?.suspendedUntil; // Grab suspendedUntil property from config files
-                const isStillSuspended = suspendedUntil > new Date();
-
-                // And create a new property in UserInfo
-                userInfo["ban"] = {
-                    status: isStillSuspended,
-                    until: suspendedUntil
-                };
-
                 this.userInfo = userInfo;
                 ChargeCache.markFromUserInfo(userInfo);
                 return true;
@@ -479,12 +516,50 @@ class WPlacer {
     }
 
     async post(url, body) {
-        const headers = { 'Content-Type': 'text/plain;charset=UTF-8' };
-        if (this.pawtect) headers['x-pawtect-token'] = this.pawtect;
+        // Build headers
+        const headers = { Accept: '*/*', 'Content-Type': 'text/plain;charset=UTF-8', Referer: 'https://wplace.live/' };
+        const isPixelEndpoint = typeof url === 'string' && url.includes('/s0/pixel/');
+        if (
+            isPixelEndpoint &&
+            currentSettings?.pawtect?.enabled &&
+            typeof currentSettings.pawtect.token === 'string' &&
+            currentSettings.pawtect.token
+        ) {
+            headers['x-pawtect-token'] = currentSettings.pawtect.token;
+        }
+
+        // Build payload with optional fp (only for pixel endpoint)
+        const payload = { ...body };
+        if (
+            isPixelEndpoint &&
+            currentSettings?.pawtect?.enabled &&
+            typeof currentSettings.pawtect.fp === 'string' &&
+            currentSettings.pawtect.fp &&
+            payload.fp === undefined
+        ) {
+            payload.fp = currentSettings.pawtect.fp;
+        }
+
+        // Verbose pawtect printout for pixel endpoint (guarded by settings)
+        if (isPixelEndpoint && currentSettings?.pawtect?.verbose) {
+            const tokenStr = headers['x-pawtect-token'] ? String(headers['x-pawtect-token']) : 'NONE';
+            const fpStr = (payload && typeof payload.fp === 'string' && payload.fp) ? payload.fp : 'NONE';
+            try {
+                console.log('x-pawtect-token:', tokenStr);
+                console.log('pawtect fp:', fpStr);
+                console.log('[PAWTECT]', 'url:', url, '| token:', tokenStr, '| fp:', fpStr);
+            } catch {}
+            try {
+                log('SYSTEM', 'pawtect', `x-pawtect-token: ${tokenStr}`);
+                log('SYSTEM', 'pawtect', `fp: ${fpStr}`);
+                log('SYSTEM', 'pawtect', `[PAWTECT] url: ${url} | token: ${tokenStr} | fp: ${fpStr}`);
+            } catch {}
+        }
+
         const req = await this._fetch(url, {
             method: 'POST',
             headers,
-            body: JSON.stringify(body),
+            body: JSON.stringify(payload),
         });
         const data = await req.json();
         return { status: req.status, data };
@@ -551,6 +626,13 @@ class WPlacer {
 
     async _executePaint(tx, ty, body) {
         if (body.colors.length === 0) return { painted: 0 };
+        try {
+            if (currentSettings?.pawtect?.enabled && currentSettings?.pawtect?.verbose) {
+                const tStr = typeof this.token === 'string' ? this.token : 'NONE';
+                console.log('turnstile t:', tStr);
+                try { log('SYSTEM', 'pawtect', `turnstile t: ${tStr}`); } catch {}
+            }
+        } catch {}
         const response = await this.post(WPLACE_PIXEL(tx, ty), body);
 
         if (response.data.painted && response.data.painted === body.colors.length) {
@@ -602,7 +684,6 @@ class WPlacer {
     _getMismatchedPixels(currentSkip = 1, colorFilter = null) {
         const [startX, startY, startPx, startPy] = this.coords;
         const out = [];
-
         for (let y = 0; y < this.template.height; y++) {
             for (let x = 0; x < this.template.width; x++) {
                 if ((x + y) % currentSkip !== 0) continue;
@@ -664,6 +745,7 @@ class WPlacer {
                         ? canvasColor === 0
                         : tplColor !== canvasColor;
                     if (shouldPaint) {
+                        // length++;
                         out.push({
                             tx: targetTx,
                             ty: targetTy,
@@ -750,7 +832,6 @@ class WPlacer {
         for (const k in byTile) {
             const [tx, ty] = k.split(',').map(Number);
             const body = { ...byTile[k], t: this.token };
-            if (globalThis.__wplacer_last_fp) body.fp = globalThis.__wplacer_last_fp;
             const r = await this._executePaint(tx, ty, body);
             total += r.painted;
         }
@@ -777,7 +858,17 @@ class WPlacer {
 // ---------- Persistence helpers ----------
 
 const loadJSON = (filename) =>
-    existsSync(filename) ? JSON.parse(readFileSync(filename, 'utf8')) : {};
+    existsSync(filename)
+        ? (() => {
+              try {
+                  const text = readFileSync(filename, 'utf8');
+                  if (!text || !text.trim()) return {};
+                  return JSON.parse(text);
+              } catch {
+                  return {};
+              }
+          })()
+        : {};
 const saveJSON = (filename, data) => writeFileSync(filename, JSON.stringify(data, null, 2));
 
 const users = loadJSON(USERS_FILE);
@@ -1003,6 +1094,33 @@ let currentSettings = {
     proxyRotationMode: 'sequential', // 'sequential' | 'random'
     logProxyUsage: false,
     openBrowserOnStart: true,
+    anonymizeLogs: true,
+    useAccountCacheUI: true,
+    tokenWaitTimeoutMs: 60000,
+    tokenPool: {
+        enabled: false,
+        targetSize: 0,
+        minSize: 0,
+        autoPreFetch: false
+    },
+    turnstileSolver: {
+        enabled: false,
+        apiHost: '127.0.0.1',
+        apiPort: '5000',
+        targetUrl: 'https://wplace.live',
+        sitekey: '0x4AAAAAABpqJe8FO0N84q0F',
+        action: 'paint',
+        coords: '60,67',
+        requestTimeoutMs: 25000,
+        headful: false,
+        useragent: null
+    },
+    pawtect: {
+        enabled: false,
+        token: null,
+        fp: null,
+        verbose: false
+    }
 };
 if (existsSync(SETTINGS_FILE)) {
     currentSettings = { ...currentSettings, ...loadJSON(SETTINGS_FILE) };
@@ -1015,37 +1133,150 @@ if (existsSync(SETTINGS_FILE)) {
         );
         currentSettings.keepAliveCooldown = MS.ONE_HOUR;
     }
+    // Sanitize token wait timeout - ensure enough time for human/browser solve
+    const minTokenWait = 55_000;
+    if (!Number.isFinite(currentSettings.tokenWaitTimeoutMs) || currentSettings.tokenWaitTimeoutMs < minTokenWait) {
+        console.log(
+            `[SYSTEM] WARNING: tokenWaitTimeoutMs too low (${duration(
+                Number(currentSettings.tokenWaitTimeoutMs || 0)
+            )}). Adjusting to 60s.`
+        );
+        currentSettings.tokenWaitTimeoutMs = 60_000;
+        try { saveJSON(SETTINGS_FILE, currentSettings); } catch {}
+    }
 }
 const saveSettings = () => saveJSON(SETTINGS_FILE, currentSettings);
 
 // ---------- Server state ----------
 
 const activeBrowserUsers = new Set();
-// Cache last-known user status to avoid 409s when user is briefly busy
-const STATUS_CACHE_TTL = 10 * 60_000; // 10 minutes
-const statusCache = new Map(); // id -> { data, ts }
-const setStatusCache = (id, data) => {
-    try { statusCache.set(String(id), { data, ts: Date.now() }); } catch {}
-};
-const getStatusCache = (id) => {
-    const e = statusCache.get(String(id));
-    if (!e) return null;
-    if (Date.now() - e.ts > STATUS_CACHE_TTL) {
-        statusCache.delete(String(id));
-        return null;
-    }
-    return e.data;
-};
-const waitForNotBusy = async (id, timeoutMs = 5_000) => {
-    const t0 = Date.now();
-    while (activeBrowserUsers.has(id) && Date.now() - t0 < timeoutMs) {
-        await sleep(200);
-    }
-    return !activeBrowserUsers.has(id);
-};
 const activeTemplateUsers = new Set();
 const templateQueue = [];
 let activePaintingTasks = 0;
+
+// ---------- Proxy traffic metrics ----------
+const proxyMetrics = {
+    byProxy: Object.create(null), // key -> { inBytes, outBytes, req }
+    series: [], // [{ t, byProxy: { key: { bytes, req } } }]
+};
+
+function getOrInitBucket(ts) {
+    const idx = proxyMetrics.series.findIndex((b) => b.t === ts);
+    if (idx !== -1) return proxyMetrics.series[idx];
+    const bucket = { t: ts, byProxy: {} };
+    proxyMetrics.series.push(bucket);
+    // keep last 120 buckets (~4 minutes @2s)
+    if (proxyMetrics.series.length > 120) proxyMetrics.series.shift();
+    return bucket;
+}
+
+function recordProxyRequestStart(proxyKey) {
+    const key = String(proxyKey || 'direct');
+    const total = (proxyMetrics.byProxy[key] ||= { inBytes: 0, outBytes: 0, req: 0 });
+    total.req += 1;
+    const now = Date.now();
+    const bucketTs = Math.floor(now / 2000) * 2000;
+    const bucket = getOrInitBucket(bucketTs);
+    const b = (bucket.byProxy[key] ||= { bytes: 0, req: 0 });
+    b.req += 1;
+}
+
+function recordProxyTraffic(proxyKey, outBytes, req) {
+    const key = String(proxyKey || 'direct');
+    const total = (proxyMetrics.byProxy[key] ||= { inBytes: 0, outBytes: 0, req: 0 });
+    // Only add bytes here; req was counted at start. If req is passed, include it.
+    const addReq = Number(req || 0);
+    total.outBytes += Number(outBytes || 0);
+    if (addReq) total.req += addReq;
+    const now = Date.now();
+    const bucketTs = Math.floor(now / 2000) * 2000;
+    const bucket = getOrInitBucket(bucketTs);
+    const b = (bucket.byProxy[key] ||= { bytes: 0, req: 0 });
+    b.bytes += Number(outBytes || 0);
+    if (addReq) b.req += addReq;
+}
+
+// ---------- Network request logging ----------
+const NETWORK_LOG_PATH = path.join(DATA_DIR, 'lognetwork.json');
+const proxyIpMap = Object.create(null); // key -> { ip, ts }
+const PROXY_IP_TTL_MS = 30 * 60 * 1000; // 30 minutes
+
+function proxyLabelFromKey(proxyKey) {
+    try {
+        if (!proxyKey || proxyKey === 'direct') return 'direct';
+        const withoutCreds = proxyKey.replace(/:\/\/.+@/, '://');
+        const m = withoutCreds.match(/^[a-z]+:\/\/([^:/]+):(\d+)/i);
+        if (m) return `${m[1]}:${m[2]}`;
+        return withoutCreds;
+    } catch { return String(proxyKey || 'direct'); }
+}
+
+async function resolveProxyIp(proxyKey) {
+    try {
+        const now = Date.now();
+        const cached = proxyIpMap[proxyKey];
+        if (cached && (now - cached.ts) < PROXY_IP_TTL_MS && cached.ip) return cached.ip;
+        // Resolve asynchronously; don't throw
+        if (proxyKey === 'direct') {
+            const res = await fetch('https://api.ipify.org?format=json').catch(() => null);
+            const ip = res ? (await res.json().catch(() => ({})))?.ip : null;
+            proxyIpMap[proxyKey] = { ip: ip || null, ts: now };
+            return proxyIpMap[proxyKey].ip;
+        }
+        const tmp = new Impit({ proxyUrl: proxyKey, ignoreTlsErrors: true });
+        const res = await tmp.fetch('https://api.ipify.org?format=json').catch(() => null);
+        const ip = res ? (await res.json().catch(() => ({})))?.ip : null;
+        proxyIpMap[proxyKey] = { ip: ip || null, ts: now };
+        return proxyIpMap[proxyKey].ip;
+    } catch {
+        proxyIpMap[proxyKey] = { ip: null, ts: Date.now() };
+        return null;
+    }
+}
+
+function appendNetworkLog(entry) {
+    try {
+        appendFileSync(NETWORK_LOG_PATH, JSON.stringify(entry) + '\n');
+    } catch {}
+}
+
+
+// --- Token SSE (Server-Sent Events) ---
+const tokenSseClients = new Set();
+function broadcastTokenEvent(data) {
+    const payload = `data: ${JSON.stringify(data)}\n\n`;
+    for (const res of tokenSseClients) {
+        try {
+            res.write(payload);
+        } catch {}
+    }
+}
+
+// --- External Turnstile solver client (API-based) ---
+async function requestTurnstileTokenViaSolver(actionOverride) {
+    try {
+        const cfg = currentSettings?.turnstileSolver;
+        if (!cfg || !cfg.enabled) return null;
+
+        const apiHost = cfg.apiHost || '127.0.0.1';
+        const apiPort = cfg.apiPort || '5000';
+        const timeoutMs = Number(cfg.requestTimeoutMs || 25000);
+        const action = (typeof actionOverride === 'string' && actionOverride) ? actionOverride : (cfg.action || 'paint');
+        const coordsStr = (typeof cfg.coords === 'string' && cfg.coords.trim()) ? cfg.coords.trim() : '60,67';
+        const url = String(cfg.targetUrl || 'https://wplace.live');
+        const sitekey = String(cfg.sitekey || '0x4AAAAAABpqJe8FO0N84q0F');
+        // Delegate to shared utils flow
+        const { fetchTurnstileTokenFlow } = await import('./utils.js');
+        log('SYSTEM', 'wplacer', `TOKEN_MANAGER: Requesting token from API: http://${apiHost}:${apiPort}/turnstile ...`);
+        const token = await fetchTurnstileTokenFlow(apiHost, apiPort, { url, sitekey, action, coords: coordsStr, timeoutMs });
+        log('SYSTEM', 'wplacer', `TOKEN_MANAGER: ✅ Got token from API`);
+        return token;
+
+    } catch (error) {
+        log('SYSTEM', 'wplacer', `TOKEN_MANAGER: API solver error: ${error?.message || error}`);
+        return null;
+    }
+}
 
 // ---------- Token manager ----------
 
@@ -1054,7 +1285,15 @@ const TokenManager = {
     tokenPromise: null,
     resolvePromise: null,
     isTokenNeeded: false,
+    isPreFetching: false,
+    refillTimer: null,
+    signalTimer: null,
     TOKEN_EXPIRATION_MS: MS.TWO_MIN,
+
+    get TARGET_POOL_SIZE() { return currentSettings?.tokenPool?.targetSize || 2; },
+    get MIN_POOL_SIZE() { return currentSettings?.tokenPool?.minSize || 1; },
+    get POOL_ENABLED() { return currentSettings?.tokenPool?.enabled !== false; },
+    get AUTO_PRE_FETCH() { return currentSettings?.tokenPool?.autoPreFetch !== false; },
 
     _purgeExpiredTokens() {
         const now = Date.now();
@@ -1063,18 +1302,172 @@ const TokenManager = {
         const removed = size0 - this.tokenQueue.length;
         if (removed > 0) log('SYSTEM', 'wplacer', `TOKEN_MANAGER: 🗑️ Discarded ${removed} expired token(s).`);
     },
-    getToken(templateName = 'Unknown') {
+
+    async _fetchTokenFromSolver() {
+        // Try external solver first if enabled
+        if (currentSettings?.turnstileSolver?.enabled) {
+            try {
+                const token = await requestTurnstileTokenViaSolver('paint');
+                if (token && typeof token === 'string') return token;
+                log('SYSTEM', 'wplacer', `TOKEN_MANAGER: External solver failed or returned no token.`);
+            } catch (solverError) {
+                log('SYSTEM', 'wplacer', `TOKEN_MANAGER: External solver error: ${solverError.message}.`);
+            }
+        }
+        return null;
+    },
+
+    async _preFetchTokens() {
+        if (!this.POOL_ENABLED || !this.AUTO_PRE_FETCH || this.isPreFetching) return;
+        this.isPreFetching = true;
+
+        try {
+            const tokensNeeded = this.TARGET_POOL_SIZE - this.tokenQueue.length;
+            if (tokensNeeded <= 0) return;
+
+            log('SYSTEM', 'wplacer', `TOKEN_MANAGER: 🔄 Pre-fetching ${tokensNeeded} tokens...`);
+
+            const fetchPromises = [];
+            for (let i = 0; i < tokensNeeded; i++) {
+                fetchPromises.push(this._fetchTokenFromSolver());
+            }
+
+            const results = await Promise.allSettled(fetchPromises);
+            let successCount = 0;
+
+            for (const result of results) {
+                if (result.status === 'fulfilled' && result.value) {
+                    this.tokenQueue.push({ token: result.value, receivedAt: Date.now() });
+                    successCount++;
+                }
+            }
+
+            if (successCount > 0) {
+                log('SYSTEM', 'wplacer', `TOKEN_MANAGER: ✅ Pre-fetched ${successCount} tokens. Pool size: ${this.tokenQueue.length}`);
+            }
+        } catch (error) {
+            log('SYSTEM', 'wplacer', `TOKEN_MANAGER: Pre-fetch error: ${error.message}`);
+        } finally {
+            this.isPreFetching = false;
+        }
+    },
+
+    _scheduleRefill() {
+        // Clear existing timer
+        if (this.refillTimer) {
+            clearTimeout(this.refillTimer);
+        }
+
+        // Schedule refill if pool is below target
+        if (this.POOL_ENABLED && this.AUTO_PRE_FETCH && this.tokenQueue.length < this.TARGET_POOL_SIZE) {
+            this.refillTimer = setTimeout(() => {
+                this._preFetchTokens().catch(() => {});
+            }, 1000); // Refill after 1 second delay
+        }
+    },
+
+    // Non-blocking signal to extension/UI that a token is needed
+    signalTokenNeeded() {
+        if (this.isTokenNeeded) return;
+        this.isTokenNeeded = true;
+        try { broadcastTokenEvent({ needed: true }); } catch {}
+        // Auto-clear after configured timeout to avoid a sticky state
+        const timeoutMs = Number(currentSettings?.tokenWaitTimeoutMs || 60000);
+        if (this.signalTimer) try { clearTimeout(this.signalTimer); } catch {}
+        this.signalTimer = setTimeout(() => {
+            this.isTokenNeeded = false;
+            this.signalTimer = null;
+            try { broadcastTokenEvent({ needed: false, timeout: true }); } catch {}
+        }, timeoutMs);
+    },
+
+    // Lightweight wait: poll the queue for a short time without changing promise state
+    async waitForTokenInQueue(maxWaitMs = 2500, pollEveryMs = 100) {
+        const start = Date.now();
+        while (Date.now() - start < maxWaitMs) {
+            this._purgeExpiredTokens();
+            if (this.tokenQueue.length > 0) {
+                const next = this.tokenQueue.shift();
+                if (next && next.token) {
+                    this._scheduleRefill();
+                    return next.token;
+                }
+            }
+            await new Promise(r => setTimeout(r, pollEveryMs));
+        }
+        return null;
+    },
+
+    // Return token immediately if available; do not set isTokenNeeded or wait
+    tryDequeueToken() {
         this._purgeExpiredTokens();
-        if (this.tokenQueue.length > 0) return Promise.resolve(this.tokenQueue.shift().token);
+        const next = this.tokenQueue.shift();
+        if (next && next.token) {
+            // Maintain pool size opportunistically
+            this._scheduleRefill();
+            return next.token;
+        }
+        return null;
+    },
+
+    // Quick check without side effects
+    tokensAvailable() {
+        this._purgeExpiredTokens();
+        return this.tokenQueue.length > 0;
+    },
+
+    async getToken(templateName = 'Unknown') {
+        this._purgeExpiredTokens();
+
+        // If pool is enabled and we have tokens available, return one immediately
+        if (this.POOL_ENABLED && this.tokenQueue.length > 0) {
+            const token = this.tokenQueue.shift().token;
+            log('SYSTEM', 'wplacer', `TOKEN_MANAGER: ✅ Token consumed from cache. Pool size: ${this.tokenQueue.length}`);
+
+            // Schedule refill to maintain pool
+            this._scheduleRefill();
+
+            return token;
+        }
+
+        // No cached tokens available, try to fetch one immediately
+        const immediateToken = await this._fetchTokenFromSolver();
+        if (immediateToken) {
+            log('SYSTEM', 'wplacer', `TOKEN_MANAGER: ✅ Token fetched immediately for "${templateName}".`);
+            // Trigger pre-fetch for future use if pool is enabled
+            if (this.POOL_ENABLED && this.AUTO_PRE_FETCH) {
+                this._preFetchTokens().catch(() => {}); // Fire and forget
+            }
+            return immediateToken;
+        }
+
+        // Fallback to waiting for manual token input
         if (!this.tokenPromise) {
             log('SYSTEM', 'wplacer', `TOKEN_MANAGER: ⏳ Template "${templateName}" is waiting for a token.`);
             this.isTokenNeeded = true;
             this.tokenPromise = new Promise((resolve) => {
                 this.resolvePromise = resolve;
             });
+            // Notify SSE listeners that a token is needed
+            try { broadcastTokenEvent({ needed: true }); } catch {}
         }
-        return this.tokenPromise;
+        // Apply a timeout so server doesn't wait forever
+        const timeoutMs = Number(currentSettings?.tokenWaitTimeoutMs || 60000);
+        return await Promise.race([
+            this.tokenPromise,
+            new Promise((_, reject) => setTimeout(() => {
+                if (this.resolvePromise) {
+                    log('SYSTEM', 'wplacer', `TOKEN_MANAGER: ⏱️ Waited ${timeoutMs}ms for token, timing out.`);
+                    this.resolvePromise = null;
+                    this.tokenPromise = null;
+                    this.isTokenNeeded = false;
+                    try { broadcastTokenEvent({ needed: false, timeout: true }); } catch {}
+                }
+                reject(new Error('TOKEN_WAIT_TIMEOUT'));
+            }, timeoutMs))
+        ]);
     },
+
     setToken(t) {
         const newToken = { token: t, receivedAt: Date.now() };
         if (this.resolvePromise) {
@@ -1083,17 +1476,72 @@ const TokenManager = {
             this.tokenPromise = null;
             this.resolvePromise = null;
             this.isTokenNeeded = false;
+            // Notify SSE listeners that need has been fulfilled
+            try { broadcastTokenEvent({ needed: false }); } catch {}
+
+            // Schedule refill after consumption to maintain pool
+            this._scheduleRefill();
         } else {
             this.tokenQueue.push(newToken);
-            log('SYSTEM', 'wplacer', `TOKEN_MANAGER: ✅ Token received. Queue size: ${this.tokenQueue.length}`);
+            log('SYSTEM', 'wplacer', `TOKEN_MANAGER: ✅ Token received. Pool size: ${this.tokenQueue.length}`);
+
+            // Schedule refill if pool is below target
+            this._scheduleRefill();
         }
     },
+
     invalidateToken() {
         // This is now handled by the consumer (getToken), but we keep it in case of explicit invalidation needs.
         const invalidated = this.tokenQueue.shift();
         if (invalidated) {
-            log('SYSTEM', 'wplacer', `TOKEN_MANAGER: 🔄 Invalidating token. ${this.tokenQueue.length} left.`);
+            log('SYSTEM', 'wplacer', `TOKEN_MANAGER: 🔄 Invalidating token. Pool size: ${this.tokenQueue.length}`);
+
+            // Schedule refill after invalidation to maintain pool
+            this._scheduleRefill();
         }
+    },
+
+    // Method to manually trigger pre-fetching
+    async ensureTokenPool() {
+        await this._preFetchTokens();
+    },
+
+    // Get current pool status
+    getPoolStatus() {
+        return {
+            currentSize: this.tokenQueue.length,
+            targetSize: this.TARGET_POOL_SIZE,
+            minSize: this.MIN_POOL_SIZE,
+            isPreFetching: this.isPreFetching,
+            isTokenNeeded: this.isTokenNeeded,
+            hasRefillTimer: !!this.refillTimer
+        };
+    },
+
+    // Start background refill system
+    startBackgroundRefill() {
+        if (this.POOL_ENABLED && this.AUTO_PRE_FETCH) {
+            // Initial refill
+            this._preFetchTokens().catch(() => {});
+
+            // Set up periodic refill check every 30 seconds
+            setInterval(() => {
+                if (this.tokenQueue.length < this.TARGET_POOL_SIZE && !this.isPreFetching) {
+                    this._preFetchTokens().catch(() => {});
+                }
+            }, 30000);
+
+            log('SYSTEM', 'wplacer', 'TOKEN_MANAGER: 🔄 Background refill system started');
+        }
+    },
+
+    // Stop background refill system
+    stopBackgroundRefill() {
+        if (this.refillTimer) {
+            clearTimeout(this.refillTimer);
+            this.refillTimer = null;
+        }
+        log('SYSTEM', 'wplacer', 'TOKEN_MANAGER: 🛑 Background refill system stopped');
     },
 };
 
@@ -1225,28 +1673,30 @@ class TemplateManager {
         let done = false;
         while (!done && this.running) {
             try {
-                wplacer.token = await TokenManager.getToken(this.name);
-                // Pull latest pawtect token if available
-                wplacer.pawtect = globalThis.__wplacer_last_pawtect || null;
+                // Fast path: only proceed if a token is immediately available; otherwise skip to next account
+                const immediate = TokenManager.tryDequeueToken?.() || null;
+                if (!immediate) {
+                    // Fire a non-blocking signal so the extension can generate one
+                    try { TokenManager.signalTokenNeeded(); } catch {}
+                    // Briefly wait for a token to arrive (non-blocking, short)
+                    const shortWaitMs = Math.min(2500, Number(currentSettings?.tokenWaitTimeoutMs || 60000) / 20);
+                    const arrived = await (TokenManager.waitForTokenInQueue?.(shortWaitMs, 100) || Promise.resolve(null));
+                    if (!arrived) {
+                        log('SYSTEM', 'wplacer', `[${this.name}] ⏭️ No token after short wait (${duration(shortWaitMs)}), skipping.`);
+                        break;
+                    }
+                    wplacer.token = arrived;
+                } else {
+                    wplacer.token = immediate;
+                }
                 const painted = await wplacer.paint(this.currentPixelSkip, colorFilter);
                 paintedTotal += painted;
                 done = true;
             } catch (error) {
                 if (error.name === 'SuspensionError') {
                     const until = new Date(error.suspendedUntil).toLocaleString();
-                    
-                    // Difference between a BAN and a SUSPENSION of the account.
-                    if (error.durationMs > 0) log(wplacer.userInfo.id, wplacer.userInfo.name, `[${this.name}] 🛑 Account suspended until ${until}.`);
-                    else log(wplacer.userInfo.id, wplacer.userInfo.name, `[${this.name}] 🛑 Account BANNED PERMANENTLY, banned due to ${error.reason}.`)
-                    
-                    /*
-                    
-                    If a BAN has been issued, instead of setting suspendedUntil to wpalcer's suspendedUntil (current date in ms),
-                    set it to a HUGE number to avoid modifying any logic in the rest of the code, and still perform properly with
-                    the banned account.
-                    
-                    */
-                    users[wplacer.userInfo.id].suspendedUntil = error.durationMs > 0 ? error.suspendedUntil : Number.MAX_SAFE_INTEGER;
+                    log(wplacer.userInfo.id, wplacer.userInfo.name, `[${this.name}] 🛑 Account suspended until ${until}.`);
+                    users[wplacer.userInfo.id].suspendedUntil = error.suspendedUntil;
                     saveUsers();
                     throw error;
                 }
@@ -1287,7 +1737,15 @@ class TemplateManager {
 
             try {
                 log('SYSTEM', 'wplacer', `[${this.name}] Checking template status with user ${users[userId].name}...`);
-                await wplacer.login(users[userId].cookies);
+                const info = await wplacer.login(users[userId].cookies);
+                try {
+                    // Mark both the remote ID and the local template userId to keep predictions in sync
+                    ChargeCache.markForLocal(userId, info);
+                    const cNow = Math.floor(info?.charges?.count ?? 0);
+                    const cMax = Math.floor(info?.charges?.max ?? 0);
+                    const dr = Math.floor(info?.droplets ?? 0);
+                    log(info.id, info.name, `[${this.name}] CHECK_TEMPLATE_STATUS: charges ${cNow}/${cMax}, droplets ${dr}`);
+                } catch {}
                 await wplacer.loadTiles();
                 const mismatchedPixels = wplacer._getMismatchedPixels(1, null); // Check all pixels, no skip, no color filter.
                 log('SYSTEM', 'wplacer', `[${this.name}] Check complete. Found ${mismatchedPixels.length} mismatched pixels.`);
@@ -1427,7 +1885,14 @@ class TemplateManager {
                                 const userId = this.userQueue.shift();
                                 const now = Date.now();
 
-                                if (!users[userId] || (users[userId].suspendedUntil && now < users[userId].suspendedUntil)) {
+                                if (!users[userId]) {
+                                    log('SYSTEM', 'wplacer', `[${this.name}] SKIP user ${userId}: not found in users map.`);
+                                    this.userQueue.push(userId);
+                                    continue;
+                                }
+                                if (users[userId].suspendedUntil && now < users[userId].suspendedUntil) {
+                                    const until = new Date(users[userId].suspendedUntil).toLocaleString();
+                                    log(userId, users[userId].name, `[${this.name}] SKIP user (suspended until ${until}).`);
                                     this.userQueue.push(userId);
                                     continue;
                                 }
@@ -1435,27 +1900,68 @@ class TemplateManager {
                                 if (ChargeCache.stale(userId, now)) {
                                     if (!activeBrowserUsers.has(userId)) {
                                         activeBrowserUsers.add(userId);
-                                        const w = new WPlacer({});
-                                        try { await w.login(users[userId].cookies); } catch (e) { logUserError(e, userId, users[userId].name, 'opportunistic resync'); } finally { activeBrowserUsers.delete(userId); }
+                                        try {
+                                            let info = null;
+                                            let lastErr = null;
+                                            for (let attempt = 0; attempt < 3; attempt++) {
+                                                const w = new WPlacer({});
+                                                try {
+                                                    info = await w.login(users[userId].cookies);
+                                                    break;
+                                                } catch (err) {
+                                                    lastErr = err;
+                                                    // Retry on transient/Cloudflare issues with a short backoff, possibly with next proxy
+                                                    const msg = String(err?.message || '');
+                                                    if (err?.name === 'NetworkError' || /Cloudflare|Rate-limited|Bad Gateway|502/i.test(msg)) {
+                                                        await sleep(1000);
+                                                        continue;
+                                                    }
+                                                    break;
+                                                }
+                                            }
+                                            if (info) {
+                                                try {
+                                                    ChargeCache.markForLocal(userId, info);
+                                                    const cNow = Math.floor(info?.charges?.count ?? 0);
+                                                    const cMax = Math.floor(info?.charges?.max ?? 0);
+                                                    const dr = Math.floor(info?.droplets ?? 0);
+                                                    log(info.id, info.name, `[${this.name}] RESYNC charges ${cNow}/${cMax}, droplets ${dr}`);
+                                                } catch {}
+                                            } else if (lastErr) {
+                                                logUserError(lastErr, userId, users[userId].name, 'opportunistic resync');
+                                            }
+                                        } finally {
+                                            activeBrowserUsers.delete(userId);
+                                        }
                                     }
                                 }
 
                                 const predicted = ChargeCache.predict(userId, now);
                                 const threshold = predicted ? Math.max(1, Math.floor(predicted.max * currentSettings.chargeThreshold)) : Infinity;
 
+                                // Debug evaluation line per user
+                                try {
+                                    const pNow = predicted ? Math.floor(predicted.count) : null;
+                                    const pMax = predicted ? Math.floor(predicted.max) : null;
+                                    const ready = !!(predicted && Math.floor(predicted.count) >= threshold);
+                                    log(userId, users[userId].name, `[${this.name}] EVAL predicted ${pNow}/${pMax} >= ${threshold} ? ${ready ? 'READY' : 'NOT READY'}`);
+                                } catch {}
+
                                 if (predicted && Math.floor(predicted.count) >= threshold) {
                                     activeBrowserUsers.add(userId);
                                     const wplacer = new WPlacer({ template: this.template, coords: this.coords, globalSettings: currentSettings, templateSettings: this, templateName: this.name });
                                     try {
                                         const userInfo = await wplacer.login(users[userId].cookies);
+                                        // Ensure prediction ties to local id as well
+                                        try { ChargeCache.markForLocal(userId, userInfo); } catch {}
                                         this.status = `Running user ${userInfo.name} | Pass (1/${this.currentPixelSkip})`;
                                         log(userInfo.id, userInfo.name, `[${this.name}] 🔋 Predicted charges: ${Math.floor(predicted.count)}/${predicted.max}.`);
 
+                                        await this.handleUpgrades(wplacer);
                                         await this._performPaintTurn(wplacer, color);
 
                                         // A paint was attempted, we assume the pass is not yet complete and will re-evaluate.
                                         foundUserForTurn = true;
-                                        await this.handleUpgrades(wplacer);
                                         await this.handleChargePurchases(wplacer);
                                     } catch (error) {
                                         if (error.name !== 'SuspensionError') logUserError(error, userId, users[userId].name, 'perform paint turn');
@@ -1658,42 +2164,159 @@ app.get('/errors', (req, res) => {
     streamLogFile(res, filePath, lastSize);
 });
 
+// --- SSE endpoint for token events ---
+app.get('/token-events', (req, res) => {
+    res.setHeader('Content-Type', 'text/event-stream');
+    res.setHeader('Cache-Control', 'no-cache');
+    res.setHeader('Connection', 'keep-alive');
+    res.flushHeaders?.();
+
+    // Immediately send current state
+    try { res.write(`data: ${JSON.stringify({ needed: TokenManager.isTokenNeeded })}\n\n`); } catch {}
+
+    tokenSseClients.add(res);
+
+    const keepalive = setInterval(() => {
+        try { res.write(':keepalive\n\n'); } catch {}
+    }, 15000);
+
+    req.on('close', () => {
+        clearInterval(keepalive);
+        tokenSseClients.delete(res);
+        try { res.end(); } catch {}
+    });
+});
+
 app.get('/token-needed', (_req, res) => res.json({ needed: TokenManager.isTokenNeeded }));
-app.post('/t', (req, res) => {
-    const { t, pawtect, fp } = req.body || {};
-    if (!t) return res.sendStatus(HTTP_STATUS.BAD_REQ);
-    // Store Turnstile token as usual
-    TokenManager.setToken(t);
-    // Also keep latest pawtect in memory for pairing with paints
+
+// Token pool management endpoints
+app.get('/token-pool/status', (_req, res) => {
+    const status = TokenManager.getPoolStatus();
+    res.json({
+        ...status,
+        config: {
+            enabled: currentSettings?.tokenPool?.enabled !== false,
+            targetSize: currentSettings?.tokenPool?.targetSize || 3,
+            minSize: currentSettings?.tokenPool?.minSize || 1,
+            autoPreFetch: currentSettings?.tokenPool?.autoPreFetch !== false
+        }
+    });
+});
+
+app.post('/token-pool/prefetch', async (_req, res) => {
     try {
-        if (pawtect && typeof pawtect === 'string') {
-            globalThis.__wplacer_last_pawtect = pawtect;
-        }
-        if (fp && typeof fp === 'string') {
-            globalThis.__wplacer_last_fp = fp;
-        }
-    } catch {}
+        await TokenManager.ensureTokenPool();
+        const status = TokenManager.getPoolStatus();
+        res.json({
+            success: true,
+            message: 'Token pre-fetch triggered',
+            poolStatus: status
+        });
+    } catch (error) {
+        res.status(500).json({
+            success: false,
+            error: error.message
+        });
+    }
+});
+
+app.post('/token-pool/clear', (_req, res) => {
+    const clearedCount = TokenManager.tokenQueue.length;
+    TokenManager.tokenQueue = [];
+    res.json({
+        success: true,
+        message: `Cleared ${clearedCount} tokens from pool`,
+        poolStatus: TokenManager.getPoolStatus()
+    });
+});
+
+app.post('/token-pool/start-refill', (_req, res) => {
+    try {
+        TokenManager.startBackgroundRefill();
+        res.json({
+            success: true,
+            message: 'Background refill system started',
+            poolStatus: TokenManager.getPoolStatus()
+        });
+    } catch (error) {
+        res.status(500).json({
+            success: false,
+            error: error.message
+        });
+    }
+});
+
+app.post('/token-pool/stop-refill', (_req, res) => {
+    try {
+        TokenManager.stopBackgroundRefill();
+        res.json({
+            success: true,
+            message: 'Background refill system stopped',
+            poolStatus: TokenManager.getPoolStatus()
+        });
+    } catch (error) {
+        res.status(500).json({
+            success: false,
+            error: error.message
+        });
+    }
+});
+
+app.post('/t', (req, res) => {
+    const { t } = req.body || {};
+    if (!t) return res.sendStatus(HTTP_STATUS.BAD_REQ);
+    TokenManager.setToken(t);
     res.sendStatus(HTTP_STATUS.OK);
 });
 
 // Users
 app.get('/users', (_req, res) => res.json(users));
 
+// Account cache APIs
+app.get('/account-cache', (_req, res) => {
+    res.json(accountCache);
+});
+app.get('/account-cache/:id', (req, res) => {
+    const entry = accountCache[req.params.id];
+    if (!entry) return res.sendStatus(HTTP_STATUS.BAD_REQ);
+    res.json(entry);
+});
+app.post('/account-cache/:id/refresh', async (req, res) => {
+    const id = req.params.id;
+    if (!users[id] || activeBrowserUsers.has(id)) return res.sendStatus(HTTP_STATUS.CONFLICT);
+    activeBrowserUsers.add(id);
+    const wplacer = new WPlacer({});
+    try {
+        const info = await wplacer.login(users[id].cookies);
+        accountCache[id] = {
+            id,
+            name: info?.name ?? users[id]?.name ?? 'Unknown',
+            droplets: info?.droplets ?? null,
+            charges: info?.charges ?? null,
+            level: info?.level ?? null,
+            extraColorsBitmap: info?.extraColorsBitmap ?? null,
+            lastUpdated: Date.now(),
+        };
+        saveAccountCache();
+        res.json(accountCache[id]);
+    } catch (error) {
+        logUserError(error, id, users[id].name, 'refresh account cache');
+        res.status(HTTP_STATUS.SRV_ERR).json({ error: error.message });
+    } finally {
+        activeBrowserUsers.delete(id);
+    }
+});
+
 app.post('/user', async (req, res) => {
     if (!req.body?.cookies || !req.body.cookies.j) return res.sendStatus(HTTP_STATUS.BAD_REQ);
     const wplacer = new WPlacer({});
     try {
         const userInfo = await wplacer.login(req.body.cookies);
-        let banned = users[userInfo.id]?.suspendedUntil; // Save any previous suspendedUntil property
         users[userInfo.id] = {
             name: userInfo.name,
             cookies: req.body.cookies,
             expirationDate: req.body.expirationDate,
         };
-
-        if (banned && banned > new Date())
-            users[userInfo.id].suspendedUntil = banned // Restore the suspsendedUntil property from users file if is still suspended
-
         saveUsers();
         res.json(userInfo);
     } catch (error) {
@@ -1736,23 +2359,37 @@ app.delete('/user/:id', async (req, res) => {
 
 app.get('/user/status/:id', async (req, res) => {
     const { id } = req.params;
-    if (!users[id]) return res.status(HTTP_STATUS.CONFLICT).json({ error: 'User not found' });
-
-    // If busy, wait briefly; if still busy, try to return cached status
-    if (activeBrowserUsers.has(id)) {
-        const ok = await waitForNotBusy(id, 5_000);
-        if (!ok) {
-            const cached = getStatusCache(id);
-            if (cached) return res.status(HTTP_STATUS.OK).json({ ...cached, cached: true });
-            return res.status(HTTP_STATUS.CONFLICT).json({ error: 'User is busy' });
-        }
-    }
-
+    if (!users[id] || activeBrowserUsers.has(id)) return res.sendStatus(HTTP_STATUS.CONFLICT);
     activeBrowserUsers.add(id);
     const wplacer = new WPlacer({});
     try {
         const userInfo = await wplacer.login(users[id].cookies);
-        setStatusCache(id, userInfo);
+        // Debug: show charges and droplets when checking
+        try {
+            const cNow = Math.floor(userInfo?.charges?.count ?? 0);
+            const cMax = Math.floor(userInfo?.charges?.max ?? 0);
+            const dr = Math.floor(userInfo?.droplets ?? 0);
+            log(id, users[id].name, `CHECK USER: charges ${cNow}/${cMax}, droplets ${dr}`);
+        } catch {}
+        // Cache last seen droplets and timestamp
+        try {
+            users[id].lastSeenDroplets = userInfo?.droplets ?? users[id].lastSeenDroplets;
+            users[id].lastSeenAt = Date.now();
+            saveUsers();
+        } catch {}
+        // Update account cache for faster UI fetches
+        try {
+            accountCache[id] = {
+                id,
+                name: userInfo?.name ?? users[id]?.name ?? 'Unknown',
+                droplets: userInfo?.droplets ?? null,
+                charges: userInfo?.charges ?? null,
+                level: userInfo?.level ?? null,
+                extraColorsBitmap: userInfo?.extraColorsBitmap ?? null,
+                lastUpdated: Date.now(),
+            };
+            saveAccountCache();
+        } catch {}
         res.status(HTTP_STATUS.OK).json(userInfo);
     } catch (error) {
         logUserError(error, id, users[id].name, 'validate cookie');
@@ -1779,8 +2416,17 @@ app.post('/users/status', async (_req, res) => {
         const wplacer = new WPlacer({});
         try {
             const userInfo = await wplacer.login(users[id].cookies);
-            setStatusCache(id, userInfo);
             results[id] = { success: true, data: userInfo };
+            // Debug: show charges and droplets when checking (bulk)
+            try {
+                const cNow = Math.floor(userInfo?.charges?.count ?? 0);
+                const cMax = Math.floor(userInfo?.charges?.max ?? 0);
+                const dr = Math.floor(userInfo?.droplets ?? 0);
+                log(id, users[id].name, `CHECK USERS (bulk): charges ${cNow}/${cMax}, droplets ${dr}`);
+            } catch {}
+            // Cache last seen droplets and timestamp
+            users[id].lastSeenDroplets = userInfo?.droplets ?? users[id].lastSeenDroplets;
+            users[id].lastSeenAt = Date.now();
         } catch (error) {
             logUserError(error, id, users[id].name, 'bulk check');
             results[id] = { success: false, error: error.message };
@@ -1796,7 +2442,304 @@ app.post('/users/status', async (_req, res) => {
             results[uid] = { success: false, error: err.message };
         }
     }
+    // Persist cached droplets for all successfully checked users
+    try { saveUsers(); } catch {}
     res.json(results);
+});
+
+// Refresh user names from API
+app.post('/users/refresh-names', async (_req, res) => {
+    const userIds = Object.keys(users);
+    const results = {};
+    let updatedCount = 0;
+    let errorCount = 0;
+
+    const USER_TIMEOUT_MS = MS.THIRTY_SEC;
+    const withTimeout = (p, ms, label) =>
+        Promise.race([p, new Promise((_, rej) => setTimeout(() => rej(new Error(`${label} timeout`)), ms))]);
+
+    const refreshUserName = async (id) => {
+        if (activeBrowserUsers.has(id)) {
+            results[id] = { success: false, error: 'User is busy.' };
+            errorCount++;
+            return;
+        }
+        activeBrowserUsers.add(id);
+        const wplacer = new WPlacer({});
+        try {
+            const userInfo = await wplacer.login(users[id].cookies);
+            if (userInfo.name && userInfo.name !== users[id].name) {
+                const oldName = users[id].name;
+                users[id].name = userInfo.name;
+                results[id] = {
+                    success: true,
+                    oldName: oldName,
+                    newName: userInfo.name,
+                    updated: true
+                };
+                updatedCount++;
+                log(id, oldName, `🔄 Name refreshed from "${oldName}" to "${userInfo.name}"`, null);
+            } else {
+                results[id] = {
+                    success: true,
+                    name: userInfo.name,
+                    updated: false
+                };
+            }
+        } catch (error) {
+            logUserError(error, id, users[id].name, 'refresh name');
+            results[id] = { success: false, error: error.message };
+            errorCount++;
+        } finally {
+            activeBrowserUsers.delete(id);
+        }
+    };
+
+    for (const uid of userIds) {
+        try {
+            await withTimeout(refreshUserName(uid), USER_TIMEOUT_MS, `user ${uid}`);
+        } catch (err) {
+            results[uid] = { success: false, error: err.message };
+            errorCount++;
+        }
+    }
+
+    if (updatedCount > 0) {
+        saveUsers();
+        log('SYSTEM', 'Users', `🔄 Refreshed ${updatedCount} user names. ${errorCount} errors.`);
+    }
+
+    res.json({
+        results,
+        summary: {
+            total: userIds.length,
+            updated: updatedCount,
+            errors: errorCount
+        }
+    });
+});
+
+// Update user settings
+app.patch('/users/:id', async (req, res) => {
+    const userId = req.params.id;
+    const { autobuy } = req.body || {};
+
+    if (!userId || !users[userId]) {
+        return res.status(400).json({ error: 'User not found' });
+    }
+
+    try {
+        // Update autobuy setting if provided
+        if (autobuy !== undefined) {
+            users[userId].autobuy = autobuy;
+            saveUsers();
+
+            log('SYSTEM', 'Users', `🔄 Updated autobuy setting for ${users[userId].name}#${userId} to: ${autobuy || 'disabled'}`);
+        }
+
+        res.json(users[userId]);
+    } catch (error) {
+        logUserError(error, userId, users[userId].name, 'update user settings');
+        res.status(500).json({ error: error.message || 'Failed to update user' });
+    }
+});
+
+// Remove duplicate users
+app.post('/users/remove-duplicates', async (_req, res) => {
+    const userIds = Object.keys(users);
+    const duplicates = [];
+    const removedUsers = [];
+    let removedCount = 0;
+
+    // Find duplicates based on name (case-insensitive) and cookies
+    const nameMap = new Map();
+    const cookieMap = new Map();
+
+    for (const id of userIds) {
+        const userName = users[id].name.toLowerCase();
+        const userCookies = JSON.stringify(users[id].cookies);
+
+        let duplicateFound = false;
+
+        // Check for name duplicates
+        if (nameMap.has(userName)) {
+            const existingId = nameMap.get(userName);
+            const existingUser = users[existingId];
+            const currentUser = users[id];
+
+            // Keep the user with more recent expiration date
+            const existingExp = existingUser.expirationDate || 0;
+            const currentExp = currentUser.expirationDate || 0;
+
+            if (currentExp > existingExp) {
+                // Current user is newer, remove the existing one
+                duplicates.push({
+                    id: existingId,
+                    name: existingUser.name,
+                    reason: 'Duplicate name - older expiration date',
+                    kept: id
+                });
+                delete users[existingId];
+                removedUsers.push(existingId);
+                removedCount++;
+                nameMap.set(userName, id);
+
+                // Remove from templates
+                for (const templateId in templates) {
+                    const manager = templates[templateId];
+                    const before = manager.userIds.length;
+                    manager.userIds = manager.userIds.filter((uid) => uid !== existingId);
+                    manager.userQueue = manager.userQueue.filter((uid) => uid !== existingId);
+                    if (manager.userIds.length < before) {
+                        if (manager.masterId === existingId) {
+                            manager.masterId = manager.userIds[0] || null;
+                            manager.masterName = manager.masterId ? users[manager.masterId].name : null;
+                        }
+                        if (manager.userIds.length === 0 && manager.running) {
+                            manager.running = false;
+                            log('SYSTEM', 'wplacer', `[${manager.name}] 🛑 Template stopped, no users left.`);
+                        }
+                    }
+                }
+
+                log('SYSTEM', 'Users', `🗑️ Removed duplicate user ${existingUser.name}#${existingId} (older), kept ${currentUser.name}#${id}`);
+            } else {
+                // Existing user is newer, remove current one
+                duplicates.push({
+                    id: id,
+                    name: currentUser.name,
+                    reason: 'Duplicate name - older expiration date',
+                    kept: existingId
+                });
+                delete users[id];
+                removedUsers.push(id);
+                removedCount++;
+
+                // Remove from templates
+                for (const templateId in templates) {
+                    const manager = templates[templateId];
+                    const before = manager.userIds.length;
+                    manager.userIds = manager.userIds.filter((uid) => uid !== id);
+                    manager.userQueue = manager.userQueue.filter((uid) => uid !== id);
+                    if (manager.userIds.length < before) {
+                        if (manager.masterId === id) {
+                            manager.masterId = manager.userIds[0] || null;
+                            manager.masterName = manager.masterId ? users[manager.masterId].name : null;
+                        }
+                        if (manager.userIds.length === 0 && manager.running) {
+                            manager.running = false;
+                            log('SYSTEM', 'wplacer', `[${manager.name}] 🛑 Template stopped, no users left.`);
+                        }
+                    }
+                }
+
+                log('SYSTEM', 'Users', `🗑️ Removed duplicate user ${currentUser.name}#${id} (older), kept ${existingUser.name}#${existingId}`);
+            }
+            duplicateFound = true;
+        }
+
+        // Check for cookie duplicates (same JWT token)
+        if (cookieMap.has(userCookies)) {
+            const existingId = cookieMap.get(userCookies);
+            const existingUser = users[existingId];
+            const currentUser = users[id];
+
+            // Keep the user with more recent expiration date
+            const existingExp = existingUser.expirationDate || 0;
+            const currentExp = currentUser.expirationDate || 0;
+
+            if (currentExp > existingExp) {
+                // Current user is newer, remove the existing one
+                if (!duplicates.some(d => d.id === existingId)) {
+                    duplicates.push({
+                        id: existingId,
+                        name: existingUser.name,
+                        reason: 'Duplicate cookies - older expiration date',
+                        kept: id
+                    });
+                    delete users[existingId];
+                    removedUsers.push(existingId);
+                    removedCount++;
+
+                    // Remove from templates
+                    for (const templateId in templates) {
+                        const manager = templates[templateId];
+                        const before = manager.userIds.length;
+                        manager.userIds = manager.userIds.filter((uid) => uid !== existingId);
+                        manager.userQueue = manager.userQueue.filter((uid) => uid !== existingId);
+                        if (manager.userIds.length < before) {
+                            if (manager.masterId === existingId) {
+                                manager.masterId = manager.userIds[0] || null;
+                                manager.masterName = manager.masterId ? users[manager.masterId].name : null;
+                            }
+                            if (manager.userIds.length === 0 && manager.running) {
+                                manager.running = false;
+                                log('SYSTEM', 'wplacer', `[${manager.name}] 🛑 Template stopped, no users left.`);
+                            }
+                        }
+                    }
+
+                    log('SYSTEM', 'Users', `🗑️ Removed duplicate user ${existingUser.name}#${existingId} (duplicate cookies), kept ${currentUser.name}#${id}`);
+                }
+            } else {
+                // Existing user is newer, remove current one
+                if (!duplicates.some(d => d.id === id)) {
+                    duplicates.push({
+                        id: id,
+                        name: currentUser.name,
+                        reason: 'Duplicate cookies - older expiration date',
+                        kept: existingId
+                    });
+                    delete users[id];
+                    removedUsers.push(id);
+                    removedCount++;
+
+                    // Remove from templates
+                    for (const templateId in templates) {
+                        const manager = templates[templateId];
+                        const before = manager.userIds.length;
+                        manager.userIds = manager.userIds.filter((uid) => uid !== id);
+                        manager.userQueue = manager.userQueue.filter((uid) => uid !== id);
+                        if (manager.userIds.length < before) {
+                            if (manager.masterId === id) {
+                                manager.masterId = manager.userIds[0] || null;
+                                manager.masterName = manager.masterId ? users[manager.masterId].name : null;
+                            }
+                            if (manager.userIds.length === 0 && manager.running) {
+                                manager.running = false;
+                                log('SYSTEM', 'wplacer', `[${manager.name}] 🛑 Template stopped, no users left.`);
+                            }
+                        }
+                    }
+
+                    log('SYSTEM', 'Users', `🗑️ Removed duplicate user ${currentUser.name}#${id} (duplicate cookies), kept ${existingUser.name}#${existingId}`);
+                }
+            }
+            duplicateFound = true;
+        }
+
+        // Only add to maps if no duplicate was found
+        if (!duplicateFound) {
+            nameMap.set(userName, id);
+            cookieMap.set(userCookies, id);
+        }
+    }
+
+    if (removedCount > 0) {
+        saveUsers();
+        saveTemplates();
+        log('SYSTEM', 'Users', `🗑️ Removed ${removedCount} duplicate users.`);
+    }
+
+    res.json({
+        duplicates,
+        removedUsers,
+        summary: {
+            total: userIds.length,
+            removed: removedCount,
+            remaining: Object.keys(users).length
+        }
+    });
 });
 
 // Templates
@@ -1994,14 +2937,110 @@ app.put('/template/:id', (req, res) => {
 
 // Settings
 app.get('/settings', (_req, res) => res.json({ ...currentSettings, proxyCount: loadedProxies.length }));
+
+// Turnstile solver status endpoint
+app.get('/turnstile-solver/status', (_req, res) => {
+    const solverConfig = currentSettings?.turnstileSolver || {};
+    res.json({
+        enabled: solverConfig.enabled || false,
+        apiHost: solverConfig.apiHost || '127.0.0.1',
+        apiPort: solverConfig.apiPort || '5000',
+        targetUrl: solverConfig.targetUrl || 'https://wplace.live',
+        sitekey: solverConfig.sitekey || '0x4AAAAAABpqJe8FO0N84q0F',
+        action: solverConfig.action || 'paint',
+        coords: solverConfig.coords || '60,67',
+        requestTimeoutMs: solverConfig.requestTimeoutMs || 25000,
+        headful: solverConfig.headful || false,
+        useragent: solverConfig.useragent || null
+    });
+});
+
+// Test Turnstile solver API connection
+app.post('/turnstile-solver/test', async (req, res) => {
+    try {
+        const solverConfig = currentSettings?.turnstileSolver || {};
+        if (!solverConfig.enabled) {
+            return res.status(400).json({
+                success: false,
+                error: 'Turnstile solver is not enabled'
+            });
+        }
+
+        const apiHost = solverConfig.apiHost || '127.0.0.1';
+        const apiPort = solverConfig.apiPort || '5000';
+        const testUrl = `http://${apiHost}:${apiPort}/`;
+
+        // Test basic connectivity
+        const response = await fetch(testUrl, {
+            method: 'GET',
+            timeout: 5000,
+            headers: {
+                'Accept': 'text/html',
+                'User-Agent': 'WPlacer/1.0'
+            }
+        });
+
+        if (response.ok) {
+            res.json({
+                success: true,
+                message: 'Turnstile solver API is accessible',
+                apiUrl: testUrl,
+                status: response.status
+            });
+        } else {
+            res.status(502).json({
+                success: false,
+                error: `API returned status ${response.status}`,
+                apiUrl: testUrl
+            });
+        }
+    } catch (error) {
+        res.status(502).json({
+            success: false,
+            error: `Failed to connect to Turnstile solver API: ${error.message}`
+        });
+    }
+});
 app.put('/settings', (req, res) => {
     const prev = { ...currentSettings };
-    currentSettings = { ...prev, ...req.body };
+    // Shallow merge, with deep merge for nested turnstileSolver key
+    if (req.body && typeof req.body === 'object' && req.body.turnstileSolver) {
+        currentSettings = {
+            ...prev,
+            ...req.body,
+            turnstileSolver: {
+                ...(prev.turnstileSolver || {}),
+                ...(req.body.turnstileSolver || {})
+            }
+        };
+    } else {
+        currentSettings = { ...prev, ...req.body };
+    }
     saveSettings();
     if (prev.chargeThreshold !== currentSettings.chargeThreshold) {
         for (const id in templates) if (templates[id].running) templates[id].interruptSleep();
     }
     res.sendStatus(HTTP_STATUS.OK);
+});
+
+// --- Proxy metrics endpoint ---
+app.get('/proxy-metrics', (_req, res) => {
+    try {
+        const enriched = {};
+        for (const k of Object.keys(proxyMetrics.byProxy)) {
+            const label = proxyLabelFromKey(k);
+            enriched[label] = {
+                ...proxyMetrics.byProxy[k],
+                ip: proxyIpMap[k]?.ip || null,
+            };
+        }
+        res.json({
+            series: proxyMetrics.series.slice(-60).map(s => ({ t: s.t, byProxy: Object.fromEntries(Object.entries(s.byProxy).map(([k,v]) => [proxyLabelFromKey(k), v])) })),
+            byProxy: enriched,
+        });
+    } catch (e) {
+        res.json({ series: [], byProxy: {} });
+    }
 });
 
 // Proxies
@@ -2011,7 +3050,6 @@ app.post('/reload-proxies', (_req, res) => {
 });
 
 // Canvas proxy (returns data URI)
-// Return raw PNG; short cache for smoother previews in the UI
 app.get('/canvas', async (req, res) => {
     const { tx, ty } = req.query;
     if (isNaN(parseInt(tx)) || isNaN(parseInt(ty))) return res.sendStatus(HTTP_STATUS.BAD_REQ);
@@ -2019,29 +3057,11 @@ app.get('/canvas', async (req, res) => {
         const proxyUrl = getNextProxy();
         const imp = new Impit({ ignoreTlsErrors: true, ...(proxyUrl ? { proxyUrl } : {}) });
         const r = await imp.fetch(TILE_URL(tx, ty));
-        if (!r.ok) return res.sendStatus(r.status);
+        if (!r.ok) return res.sendStatus(response.status);
         const buffer = Buffer.from(await r.arrayBuffer());
-        res.set('Content-Type', 'image/png');
-        res.set('Cache-Control', 'public, max-age=30');
-        res.send(buffer);
+        res.json({ image: `data:image/png;base64,${buffer.toString('base64')}` });
     } catch (error) {
         res.status(HTTP_STATUS.SRV_ERR).json({ error: error.message });
-    }
-});
-
-// Palette API for UI to stay in sync with server palette and names
-// Used by the UI to sync palette on startup
-app.get('/palette', (_req, res) => {
-    try {
-        const colors = Object.entries(palette).map(([rgb, id]) => ({
-            id,
-            rgb,
-            name: COLOR_NAMES[id] || null,
-        }));
-        res.json({ colors });
-    } catch (e) {
-        console.warn('[palette] failed:', e?.message || e);
-        res.status(HTTP_STATUS.SRV_ERR).json({ error: 'Failed to get palette' });
     }
 });
 
@@ -2239,7 +3259,7 @@ const diffVer = (v1, v2) => {
                 ▒▒▒▒▒                                          v${version}`));
     // check versions (dont delete this ffs)
     try {
-        const githubPackage = await fetch("https://raw.githubusercontent.com/wplacer/wplacer/refs/heads/main/package.json");
+        const githubPackage = await fetch("https://raw.githubusercontent.com/luluwaffless/wplacer/refs/heads/main/package.json");
         const githubVersion = (await githubPackage.json()).version;
         const diff = diffVer(version, githubVersion);
         if (diff !== 0) console.warn(`${diff < 0 ? "⚠️ Outdated version! Please update using \"git pull\"." : "🤖 Unreleased."}\n  GitHub: ${githubVersion}\n  Local: ${version} (${diff})`);
@@ -2314,16 +3334,23 @@ const diffVer = (v1, v2) => {
         }
         const port = probe[idx];
         const server = app.listen(port, APP_HOST);
-            // --- Attach WebSocket server for logs ---
+        server.on('listening', () => {
+            const url = `http://localhost:${port}`;
+            console.log(`✅ Server listening on ${url}`);
+            console.log('   Open the web UI in your browser to start.');
+            if (currentSettings.openBrowserOnStart) openBrowser(url);
+
+            // --- Attach WebSocket server for logs (only after successful listen) ---
             if (!wsLogServer) {
                 wsLogServer = new WebSocketServer({ server, path: '/ws-logs' });
+                wsLogServer.on('error', (err) => {
+                    console.error('WS server error:', err.message || err);
+                });
 
                 wsLogServer.on('connection', (ws, req) => {
-                    // URL: ws://host/ws-logs?type=logs|errors
                     const url = new URL(req.url, `http://${req.headers.host}`);
                     const type = url.searchParams.get('type') === 'errors' ? 'errors' : 'logs';
                     wsClients[type].add(ws);
-                    // Send initial log history (last 200 lines)
                     try {
                         const file = path.join(DATA_DIR, type + '.log');
                         const data = readFileSync(file, 'utf8');
@@ -2345,35 +3372,22 @@ const diffVer = (v1, v2) => {
                         if (event === 'change') {
                             try {
                                 const stats = statSync(file);
-                                // Handle truncation/rotation
-                                if (stats.size < lastSize) lastSize = 0;
                                 if (stats.size > lastSize) {
-                                    const start = lastSize;
-                                    const endSize = stats.size;
-                                    const stream = createReadStream(file, { start });
-                                    let buffer = '';
-                                    stream.on('data', (chunk) => { buffer += chunk.toString(); });
-                                    stream.on('end', () => {
-                                        buffer.split(/\r?\n/).filter(Boolean).forEach((line) => broadcastLog(type, line));
-                                        lastSize = endSize;
-                                    });
-                                    stream.on('error', (err) => {
-                                        console.warn('[logs] tail error:', err?.message || err);
-                                    });
+                                    const fd = readFileSync(file);
+                                    const newData = fd.slice(lastSize).toString();
+                                    newData.split(/\r?\n/).filter(Boolean).forEach(line => broadcastLog(type, line));
+                                    lastSize = stats.size;
                                 }
                             } catch {}
                         }
                     });
                 }
             }
-        server.on('listening', () => {
-            const url = `http://localhost:${port}`;
-            console.log(`✅ Server listening on ${url}`);
-            console.log('   Open the web UI in your browser to start.');
-            if (currentSettings.openBrowserOnStart) openBrowser(url);
 
             setInterval(runKeepAlive, currentSettings.keepAliveCooldown);
             log('SYSTEM', 'KeepAlive', `🔄 User session keep-alive started. Interval: ${duration(currentSettings.keepAliveCooldown)}.`);
+
+            // Skip token pool initialization; pool disabled by default
 
             autostartedTemplates.forEach((id) => {
                 const manager = templates[id];
@@ -2411,3 +3425,68 @@ const diffVer = (v1, v2) => {
     };
     tryListen(0);
 })();
+
+// Purchase API endpoint
+app.post('/api/purchase', async (req, res) => {
+    const { productId, amount, variant, j } = req.body || {};
+
+    if (!productId || !amount || !j) {
+        return res.status(400).json({
+            success: false,
+            error: 'Missing required parameters: productId, amount, and j (token) are required'
+        });
+    }
+
+    // Find user by token
+    let userId = null;
+    let user = null;
+
+    for (const id in users) {
+        if (users[id].cookies && users[id].cookies.j === j) {
+            userId = id;
+            user = users[id];
+            break;
+        }
+    }
+
+    if (!user) {
+        return res.status(401).json({
+            success: false,
+            error: 'Invalid or expired token'
+        });
+    }
+
+    try {
+        const wplacer = new WPlacer({});
+        await wplacer.login(user.cookies);
+
+        let purchaseData = { product: { id: productId, amount } };
+
+        // Add variant for premium colors
+        if (variant !== undefined) {
+            purchaseData.product.variant = variant;
+        }
+
+        const result = await wplacer.post(WPLACE_PURCHASE, purchaseData);
+
+        // The wrapper returns { status, data } where data is the upstream JSON
+        if (result && result.data && result.data.success) {
+            // Log successful purchase
+            log(userId, user.name, `🛒 Purchased product #${productId} x${amount}${variant ? ` (variant: ${variant})` : ''}`, null);
+
+            res.json({
+                success: true,
+                message: `Successfully purchased product #${productId} x${amount}${variant ? ` (variant: ${variant})` : ''}`,
+                data: result.data
+            });
+        } else {
+            throw new Error(`Purchase failed: ${JSON.stringify(result && result.data ? result.data : result)}`);
+        }
+    } catch (error) {
+        logUserError(error, userId, user.name, `purchase product #${productId}`);
+        res.status(500).json({
+            success: false,
+            error: error.message || 'Purchase failed'
+        });
+    }
+});
