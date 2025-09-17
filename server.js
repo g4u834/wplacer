@@ -428,15 +428,7 @@ class WPlacer {
     async _fetch(url, options) {
         try {
             // Add a default timeout to all requests to prevent hangs
-            const defaultHeaders = {
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
-                'Accept': 'application/json, text/plain, */*',
-                'Accept-Language': 'en-US,en;q=0.9',
-                // Referer helps some CF setups; safe default for this backend
-                'Referer': 'https://wplace.live/'
-            };
-            const mergedHeaders = { ...(defaultHeaders), ...(options?.headers || {}) };
-            const optsWithTimeout = { timeout: 30000, ...options, headers: mergedHeaders };
+            const optsWithTimeout = { timeout: 30000, ...options };
             const start = Date.now();
             try { recordProxyRequestStart(this.browser?.options?.proxyUrl || 'direct'); } catch {}
             const res = await this.browser.fetch(url, optsWithTimeout);
@@ -689,7 +681,7 @@ class WPlacer {
     }
 
     /** Compute pixels needing change, honoring modes. */
-    _getMismatchedPixels(currentSkip = 1, colorFilter = null) {
+    _getMismatchedPixels(currentSkip = 1, colorFilter = null, ignoreColorOwnership = false) {
         const [startX, startY, startPx, startPy] = this.coords;
         const out = [];
         for (let y = 0; y < this.template.height; y++) {
@@ -748,7 +740,7 @@ class WPlacer {
                     continue;
                 }
                 // positive colors
-                if (tplColor > 0 && this.hasColor(tplColor)) {
+                if (tplColor > 0 && (ignoreColorOwnership || this.hasColor(tplColor))) {
                     const shouldPaint = this.templateSettings.skipPaintedPixels
                         ? canvasColor === 0
                         : tplColor !== canvasColor;
@@ -1614,6 +1606,7 @@ class TemplateManager {
         this.currentRetryDelay = this.initialRetryDelay;
 
         this.userQueue = [...this.userIds];
+        this.parkedUserIds = new Set();
     }
 
     /* Sleep that can be interrupted when settings change. */
@@ -1754,7 +1747,7 @@ class TemplateManager {
                     log(info.id, info.name, `[${this.name}] CHECK_TEMPLATE_STATUS: charges ${cNow}/${cMax}, droplets ${dr}`);
                 } catch {}
                 await wplacer.loadTiles();
-                const mismatchedPixels = wplacer._getMismatchedPixels(1, null); // Check all pixels, no skip, no color filter.
+                const mismatchedPixels = wplacer._getMismatchedPixels(1, null, true); // Check all pixels, no skip, no color filter.
                 log('SYSTEM', 'wplacer', `[${this.name}] Check complete. Found ${mismatchedPixels.length} mismatched pixels.`);
                 return { wplacer, mismatchedPixels }; // Success
             } catch (error) {
@@ -1775,6 +1768,7 @@ class TemplateManager {
 
         try {
             while (this.running) {
+                this.parkedUserIds.clear();
                 this.status = 'Checking for pixels...';
                 log('SYSTEM', 'wplacer', `[${this.name}] 💓 Starting new check cycle...`);
                 // --- Find a working user and get mismatched pixels ---
@@ -1823,6 +1817,33 @@ class TemplateManager {
                 }
 
                 this.pixelsRemaining = checkResult.mismatchedPixels.length;
+
+                // --- Pre-flight check to park users without required colors for this cycle ---
+                if (this.pixelsRemaining > 0) {
+                    log('SYSTEM', 'wplacer', `[${this.name}] Checking ${this.userIds.length} users for color palette compatibility...`);
+                    const neededColors = new Set(checkResult.mismatchedPixels.map(p => p.color));
+
+                    for (const userId of this.userIds) {
+                        if (this.parkedUserIds.has(userId) || !users[userId] || (users[userId].suspendedUntil && Date.now() < users[userId].suspendedUntil)) {
+                            continue; // Skip already parked, suspended, or non-existent users
+                        }
+
+                        const wplacer = new WPlacer({}); // Lightweight instance for the check
+                        try {
+                            // We must log in to get the user's color bitmap
+                            await wplacer.login(users[userId].cookies);
+                            const canHelp = Array.from(neededColors).some(colorId => wplacer.hasColor(colorId));
+
+                            if (!canHelp) {
+                                this.parkedUserIds.add(userId);
+                                log(userId, users[userId].name, `[${this.name}] 🅿️ Parking user for this cycle, no matching colors for remaining pixels.`);
+                            }
+                        } catch (error) {
+                            logUserError(error, userId, users[userId].name, 'color palette compatibility check');
+                            // Don't park on error, let the main loop handle it as a user failure.
+                        }
+                    }
+                }
 
                 // --- COMPLETION & ANTI-GRIEF CHECK ---
                 if (this.pixelsRemaining === 0) {
@@ -1890,6 +1911,12 @@ class TemplateManager {
                             const queueSize = this.userQueue.length;
                             for (let i = 0; i < queueSize; i++) {
                                 const userId = this.userQueue.shift();
+
+                                if (this.parkedUserIds.has(userId)) {
+                                    this.userQueue.push(userId); // Keep them in the queue but don't use them
+                                    continue;
+                                }
+
                                 const now = Date.now();
 
                                 if (!users[userId]) {
@@ -1964,11 +1991,11 @@ class TemplateManager {
                                         this.status = `Running user ${userInfo.name} | Pass (1/${this.currentPixelSkip})`;
                                         log(userInfo.id, userInfo.name, `[${this.name}] 🔋 Predicted charges: ${Math.floor(predicted.count)}/${predicted.max}.`);
 
-                                        await this.handleUpgrades(wplacer);
                                         await this._performPaintTurn(wplacer, color);
 
                                         // A paint was attempted, we assume the pass is not yet complete and will re-evaluate.
                                         foundUserForTurn = true;
+                                        await this.handleUpgrades(wplacer);
                                         await this.handleChargePurchases(wplacer);
                                     } catch (error) {
                                         if (error.name !== 'SuspensionError') logUserError(error, userId, users[userId].name, 'perform paint turn');
