@@ -428,7 +428,15 @@ class WPlacer {
     async _fetch(url, options) {
         try {
             // Add a default timeout to all requests to prevent hangs
-            const optsWithTimeout = { timeout: 30000, ...options };
+            const defaultHeaders = {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+                'Accept': 'application/json, text/plain, */*',
+                'Accept-Language': 'en-US,en;q=0.9',
+                // Referer helps some CF setups; safe default for this backend
+                'Referer': 'https://wplace.live/'
+            };
+            const mergedHeaders = { ...(defaultHeaders), ...(options?.headers || {}) };
+            const optsWithTimeout = { timeout: 30000, ...options, headers: mergedHeaders };
             const start = Date.now();
             try { recordProxyRequestStart(this.browser?.options?.proxyUrl || 'direct'); } catch {}
             const res = await this.browser.fetch(url, optsWithTimeout);
@@ -745,7 +753,6 @@ class WPlacer {
                         ? canvasColor === 0
                         : tplColor !== canvasColor;
                     if (shouldPaint) {
-                        // length++;
                         out.push({
                             tx: targetTx,
                             ty: targetTy,
